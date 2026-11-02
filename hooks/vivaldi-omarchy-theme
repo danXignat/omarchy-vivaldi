@@ -1,0 +1,4 @@
+#!/bin/bash
+tool="$HOME/.config/omarchy/plugins/io.github.danxignat.vivaldi/bin/vivaldi-omarchy"
+[[ -x $tool ]] || exit 0
+exec "$tool" theme sync

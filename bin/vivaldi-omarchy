@@ -1,0 +1,490 @@
+#!/bin/bash
+# Vivaldi integration for Omarchy. See ../README.md.
+set -euo pipefail
+
+ID=io.github.danxignat.vivaldi
+ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}
+STATE=${VIVALDI_OMARCHY_STATE:-$HOME/.local/state/vivaldi-omarchy}
+PROFILE_ROOT=${VIVALDI_OMARCHY_PROFILE_ROOT:-$CONFIG/vivaldi}
+PALETTE=${VIVALDI_OMARCHY_PALETTE:-$HOME/.local/state/omarchy/current/theme/colors.toml}
+HYPR=$CONFIG/hypr/hyprland.lua
+MENU=$CONFIG/omarchy/extensions/omarchy-menu.jsonc
+FLAGS=$CONFIG/vivaldi-stable.conf
+THEME_ID=Omarchy
+POLICY_DIR=/etc/vivaldi/policies/managed
+DRY_RUN=0
+
+die() { echo "vivaldi-omarchy: $*" >&2; exit 1; }
+say() { echo "vivaldi-omarchy: $*"; }
+
+# Print a file without its managed block, or with the block's blank separator.
+strip_block() {
+  local file=$1 prefix=$2
+  [[ -f $file ]] || return 0
+  awk -v begin="$prefix BEGIN $ID" -v end="$prefix END $ID" '
+    { lines[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (lines[i] == begin) {
+          if (n > 0 && out[n] == "") n--
+          while (i <= NR && lines[i] != end) i++
+          continue
+        }
+        out[++n] = lines[i]
+      }
+      for (i = 1; i <= n; i++) print out[i]
+    }' "$file"
+}
+
+# Replace file with the content on stdin. Back it up first, and only if changed.
+commit() {
+  local file=$1 tmp
+  if ((DRY_RUN)); then
+    tmp=$(mktemp)
+    cat >"$tmp"
+    if [[ ! -f $file ]] || ! cmp -s "$tmp" "$file"; then
+      echo "would change $file:"
+      if [[ -f $file ]]; then
+        diff -u --label current --label new "$file" "$tmp" || true
+      else
+        cat "$tmp"
+      fi
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+  tmp=$(mktemp "$file.XXXXXX")
+  cat >"$tmp"
+  if [[ -f $file ]] && cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  if [[ -f $file ]]; then
+    cp -a "$file" "$file.bak.$(date +%s)"
+    chmod --reference="$file" "$tmp"
+  fi
+  mv "$tmp" "$file"
+  say "updated $file"
+}
+
+block() {
+  printf '%s BEGIN %s\n' "$2" "$ID"
+  cat "$1"
+  printf '%s END %s\n' "$2" "$ID"
+}
+
+# Drop the unmanaged rules an earlier manual setup added to hyprland.lua.
+strip_manual_hypr_rules() {
+  awk '
+    { lines[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (lines[i] ~ /^-- Omarchy.s browser rule expects "Vivaldi-stable"/ &&
+            lines[i + 1] ~ /^o\.window\("vivaldi-stable", \{ tag = "\+chromium-based-browser" \}\)$/ &&
+            lines[i + 2] ~ /^o\.window\("vivaldi-stable", \{ tag = "-default-opacity" \}\)$/) {
+          if (n > 0 && out[n] == "") n--
+          i += 2
+          continue
+        }
+        out[++n] = lines[i]
+      }
+      for (i = 1; i <= n; i++) print out[i]
+    }'
+}
+
+apply_hypr() {
+  local content before
+  before=$(mktemp)
+  [[ -f $HYPR ]] || die "$HYPR not found"
+  cp -a "$HYPR" "$before"
+  content=$(strip_block "$HYPR" -- | strip_manual_hypr_rules)
+  { printf '%s\n\n' "$content"; block "$ROOT/assets/hypr.lua" --; } | commit "$HYPR"
+  if ((DRY_RUN)); then
+    rm -f "$before"
+    return 0
+  fi
+  if ! cmp -s "$before" "$HYPR" && command -v hyprctl >/dev/null && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    hyprctl reload >/dev/null
+    if [[ -n $(hyprctl configerrors | tr -d '[:space:]') ]]; then
+      cp -a "$before" "$HYPR"
+      hyprctl reload >/dev/null
+      rm -f "$before"
+      die "Hyprland rejected the rules; restored $HYPR"
+    fi
+  fi
+  rm -f "$before"
+}
+
+remove_hypr() {
+  [[ -f $HYPR ]] || return 0
+  strip_block "$HYPR" -- | commit "$HYPR"
+  if command -v hyprctl >/dev/null && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    hyprctl reload >/dev/null
+  fi
+}
+
+# The shell's parser removes whole-line comments and trailing commas, but a
+# previous row still needs its comma before our block goes in after it.
+apply_menu() {
+  local base last
+  if [[ -f $MENU ]]; then
+    base=$(strip_block "$MENU" //)
+  else
+    ((DRY_RUN)) || mkdir -p "$(dirname "$MENU")"
+    base=$'{\n}'
+  fi
+  last=$(printf '%s\n' "$base" | grep -vE '^[[:space:]]*(//.*)?$' | tail -n 2 | head -n 1 | sed 's/[[:space:]]*$//')
+  grep -qE '^[[:space:]]*}[[:space:]]*$' <<<"$(printf '%s\n' "$base" | grep -vE '^[[:space:]]*(//.*)?$' | tail -n 1)" ||
+    die "$MENU must end with a closing brace on its own line"
+  [[ $last == *, || $last == *'{' ]] || die "add a comma after the last row in $MENU, then re-run setup"
+  printf '%s\n' "$base" | awk -v blockfile=<(block "$ROOT/assets/menu.jsonc" //) '
+    { lines[NR] = $0; if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) closing = NR }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (i == closing) while ((getline line < blockfile) > 0) print line
+        print lines[i]
+      }
+    }' | commit "$MENU"
+}
+
+remove_menu() {
+  [[ -f $MENU ]] || return 0
+  # Our block sits directly before the brace, with no blank separator to remove.
+  awk -v begin="// BEGIN $ID" -v end="// END $ID" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip' "$MENU" | commit "$MENU"
+}
+
+apply_flags() {
+  local base
+  base=$(strip_block "$FLAGS" '#')
+  { [[ -n $base ]] && printf '%s\n\n' "$base"; block "$ROOT/assets/flags.conf" '#'; } | commit "$FLAGS"
+}
+
+remove_flags() {
+  local base
+  [[ -f $FLAGS ]] || return 0
+  base=$(strip_block "$FLAGS" '#')
+  if [[ -z ${base//[[:space:]]/} ]]; then
+    cp -a "$FLAGS" "$FLAGS.bak.$(date +%s)"
+    rm -f "$FLAGS"
+    say "removed $FLAGS"
+  else
+    printf '%s\n' "$base" | commit "$FLAGS"
+  fi
+}
+
+install_hooks() {
+  omarchy hook install theme-set "$ROOT/hooks/vivaldi-omarchy-theme" >/dev/null
+  omarchy hook install post-update "$ROOT/hooks/vivaldi-omarchy-update" >/dev/null
+}
+
+remove_hooks() {
+  rm -f "$CONFIG/omarchy/hooks/theme-set.d/vivaldi-omarchy-theme" \
+    "$CONFIG/omarchy/hooks/post-update.d/vivaldi-omarchy-update"
+}
+
+install_policy() {
+  local run=sudo
+  if ((DRY_RUN)); then
+    echo "would install $POLICY_DIR/omarchy.json as root"
+    return 0
+  fi
+  [[ -t 0 ]] || run=pkexec
+  "$run" install -d -m 0755 -o root -g root /etc/vivaldi /etc/vivaldi/policies "$POLICY_DIR"
+  "$run" install -m 0644 -o root -g root -T \
+    "${OMARCHY_PATH:-/usr/share/omarchy}/default/chromium/policies/omarchy.json" "$POLICY_DIR/omarchy.json"
+  say "installed $POLICY_DIR/omarchy.json"
+}
+
+remove_policy() {
+  local run=sudo
+  [[ -e $POLICY_DIR/omarchy.json ]] || return 0
+  [[ -t 0 ]] || run=pkexec
+  "$run" rm -f "$POLICY_DIR/omarchy.json"
+}
+
+# Hyprchroma writes its own Vivaldi theme when its browsers option is on, and
+# two writers would fight over Preferences.
+hyprchroma_manages_vivaldi() {
+  [[ -z ${VIVALDI_OMARCHY_IGNORE_HYPRCHROMA:-} ]] || return 1
+  systemctl --user is-active --quiet hyprchromad.service 2>/dev/null || return 1
+  [[ $(jq -r '.frameworks.browsers // false' "$HOME/.local/state/hyprchroma/settings.json" 2>/dev/null) == true ]]
+}
+
+# Vivaldi rewrites Preferences as it exits, so a write while it runs is lost.
+vivaldi_running() {
+  local lock pid
+  lock=$(readlink "$PROFILE_ROOT/SingletonLock" 2>/dev/null) || return 1
+  pid=${lock##*-}
+  [[ $pid =~ ^[0-9]+$ && $(readlink "/proc/$pid/exe" 2>/dev/null) == */vivaldi-bin ]]
+}
+
+palette_value() {
+  sed -nE "s/^$1[[:space:]]*=[[:space:]]*\"(#[0-9a-fA-F]{6})\".*/\1/p" "$PALETTE" | head -n 1
+}
+
+theme_sync() {
+  local background foreground accent window
+  if hyprchroma_manages_vivaldi; then
+    say "Hyprchroma manages Vivaldi's theme; leaving it alone"
+    return 0
+  fi
+  [[ -f $PALETTE ]] || die "theme palette not found: $PALETTE"
+  background=$(palette_value background)
+  foreground=$(palette_value foreground)
+  accent=$(palette_value accent)
+  window=$(palette_value dark_background)
+  [[ -n $background && -n $foreground && -n $accent ]] || die "palette is missing required colours"
+  mkdir -p "$STATE"
+  jq -n --arg id "$THEME_ID" --arg bg "$background" --arg fg "$foreground" --arg ac "$accent" --arg win "${window:-$background}" '{
+    accentFromPage: false, accentOnWindow: false, accentSaturationLimit: 1, alpha: 1,
+    backgroundImage: "", backgroundPosition: "stretch", backgroundSource: "", blur: 0,
+    colorAccentBg: $bg, colorBg: $bg, colorFg: $fg, colorHighlightBg: $ac, colorPosition: "unified",
+    colorWindowBg: $win, contrast: 0, engineVersion: 1, id: $id, name: $id,
+    preferSystemAccent: false, radius: 8, transparencyTabBar: false, transparencyTabs: false,
+    url: "", version: 1
+  }' >"$STATE/pending.json"
+  theme_apply
+}
+
+profiles() {
+  jq -r '.profile.info_cache | keys[]' "$PROFILE_ROOT/Local State"
+}
+
+write_preferences() {
+  local prefs=$1 filter=$2 tmp
+  shift 2
+  tmp=$(mktemp "$prefs.XXXXXX")
+  chmod --reference="$prefs" "$tmp"
+  if jq -c "$@" "$filter" "$prefs" >"$tmp" && jq -e '.vivaldi.themes' "$tmp" >/dev/null; then
+    mv "$tmp" "$prefs"
+  else
+    rm -f "$tmp"
+    die "refused to write invalid Preferences: $prefs"
+  fi
+}
+
+theme_apply() {
+  local profile prefs saved
+  [[ -f $STATE/pending.json ]] || return 0
+  hyprchroma_manages_vivaldi && return 0
+  # A profile appears on Vivaldi's first run, so keep the theme queued until then.
+  [[ -f "$PROFILE_ROOT/Local State" ]] || return 0
+  if vivaldi_running; then
+    say "Vivaldi is open; the theme applies when it closes"
+    return 0
+  fi
+  while IFS= read -r profile; do
+    prefs=$PROFILE_ROOT/$profile/Preferences
+    [[ -f $prefs ]] || continue
+    saved=$STATE/original/$profile.json
+    if [[ ! -f $saved ]]; then
+      mkdir -p "$(dirname "$saved")"
+      jq --arg id "$THEME_ID" '{
+        current: .vivaldi.themes.current,
+        schedule: .vivaldi.theme.schedule,
+        entry: ([.vivaldi.themes.user[]? | select(.id == "Hyprchroma")] | first)
+      }' "$prefs" >"$saved"
+    fi
+    cp -a "$prefs" "$prefs.bak.vivaldi-omarchy"
+    # shellcheck disable=SC2016 # jq variables, not shell ones
+    write_preferences "$prefs" '
+      .vivaldi.themes.user = (([.vivaldi.themes.user[]? | select(.id != $theme.id)]) + [$theme])
+      | .vivaldi.themes.current = $theme.id
+      | .vivaldi.theme.schedule.o_s = {dark: $theme.id, light: $theme.id}
+    ' --argjson theme "$(cat "$STATE/pending.json")"
+    write_preferences "$prefs" '.vivaldi.themes.user |= [.[] | select(.id != "Hyprchroma")]'
+  done < <(profiles)
+  rm -f "$STATE/pending.json"
+  say "applied the theme to Vivaldi"
+}
+
+theme_restore() {
+  local saved profile prefs
+  [[ -d $STATE/original ]] || { rm -f "$STATE/pending.json"; return 0; }
+  if vivaldi_running; then
+    die "close Vivaldi first so its theme can be restored"
+  fi
+  for saved in "$STATE"/original/*.json; do
+    [[ -f $saved ]] || continue
+    profile=$(basename "$saved" .json)
+    prefs=$PROFILE_ROOT/$profile/Preferences
+    [[ -f $prefs ]] || continue
+    # shellcheck disable=SC2016 # jq variables, not shell ones
+    write_preferences "$prefs" '
+      $saved[0] as $old
+      | .vivaldi.themes.user = ([.vivaldi.themes.user[]? | select(.id != $id)] + (if $old.entry then [$old.entry] else [] end))
+      | (if $old.current then .vivaldi.themes.current = $old.current else del(.vivaldi.themes.current) end)
+      | (if $old.schedule then .vivaldi.theme.schedule = $old.schedule else del(.vivaldi.theme.schedule) end)
+    ' --slurpfile saved "$saved" --arg id "$THEME_ID"
+    rm -f "$saved"
+  done
+  rm -f "$STATE/pending.json"
+  rmdir "$STATE/original" 2>/dev/null || true
+}
+
+cmd_default() {
+  command -v vivaldi-stable >/dev/null || die "Vivaldi isn't installed"
+  env -u BROWSER XDG_CURRENT_DESKTOP= xdg-settings set default-web-browser vivaldi-stable.desktop
+  local type
+  for type in x-scheme-handler/about x-scheme-handler/unknown text/html; do
+    XDG_CURRENT_DESKTOP='' xdg-mime default vivaldi-stable.desktop "$type"
+  done
+  omarchy-notification-send -g 󰖟 "Vivaldi is now the default browser"
+}
+
+cmd_remove() {
+  if [[ $(omarchy-cmd-default-browser) == vivaldi-stable.desktop ]] && omarchy-cmd-present chromium; then
+    env -u BROWSER XDG_CURRENT_DESKTOP= xdg-settings set default-web-browser chromium.desktop || true
+  fi
+  omarchy-pkg-drop vivaldi
+  remove_flags
+  remove_policy
+}
+
+cmd_setup() {
+  local policy=0 default=0 option
+  for option in "$@"; do
+    case $option in
+    --policy) policy=1 ;;
+    --default) default=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) die "unknown setup option: $option" ;;
+    esac
+  done
+  command -v vivaldi-stable >/dev/null || say "Vivaldi isn't installed; use the Install menu row or: omarchy pkg add vivaldi"
+  apply_hypr
+  apply_menu
+  apply_flags
+  ((policy == 0)) || install_policy
+  if ((DRY_RUN)); then
+    echo "would install the theme-set and post-update hooks"
+    ((default == 0)) || echo "would make Vivaldi the default browser"
+    return 0
+  fi
+  install_hooks
+  ((default == 0)) || cmd_default
+  mkdir -p "$STATE"
+  : >"$STATE/setup-done"
+  if hyprchroma_manages_vivaldi; then
+    say "Hyprchroma manages Vivaldi's theme, so theme sync stays off"
+  else
+    theme_sync
+  fi
+  say "setup done; restart Vivaldi to pick up the flags"
+}
+
+# plugin add can't run setup, and setup must not edit config unasked, so say once
+# that it's needed.
+cmd_first_run() {
+  [[ -e $STATE/setup-done || -e $STATE/setup-notified ]] && return 0
+  mkdir -p "$STATE"
+  : >"$STATE/setup-notified"
+  omarchy-notification-send -g 󰖟 "Finish setting up Vivaldi" "Run $ROOT/bin/vivaldi-omarchy setup"
+}
+
+cmd_uninstall() {
+  theme_restore
+  remove_hooks
+  remove_flags
+  remove_menu
+  remove_hypr
+  remove_policy
+  rm -f "$STATE/setup-done" "$STATE/setup-notified"
+  rmdir "$STATE" 2>/dev/null || true
+  omarchy plugin disable "$ID" >/dev/null 2>&1 || true
+  say "uninstalled; run: omarchy plugin remove $ID"
+}
+
+# True when the file's managed block matches what this version would write.
+block_current() {
+  local file=$1 prefix=$2 asset=$3
+  [[ -f $file ]] || return 1
+  [[ $(awk -v begin="$prefix BEGIN $ID" -v end="$prefix END $ID" '
+    $0 == begin { on = 1 }
+    on { print }
+    $0 == end { on = 0 }' "$file") == "$(block "$asset" "$prefix")" ]]
+}
+
+cmd_doctor() {
+  local quiet=${1:-} problems=0
+  report() { # level message
+    [[ $1 == ok && $quiet == --quiet ]] && return 0
+    [[ $quiet == --quiet && $1 == note ]] && return 0
+    printf '%-5s %s\n' "$1" "$2"
+  }
+  check() { # message command...
+    local message=$1
+    shift
+    if "$@" >/dev/null 2>&1; then
+      report ok "$message"
+    else
+      report FAIL "$message"
+      problems=$((problems + 1))
+    fi
+  }
+  check "Vivaldi is installed" command -v vivaldi-stable
+  if [[ $(omarchy-cmd-default-browser) != vivaldi-stable.desktop ]]; then
+    report note "Vivaldi isn't the default browser; run: vivaldi-omarchy default"
+  fi
+  check "links route through omarchy-browser.desktop" test "$(xdg-mime query default x-scheme-handler/https)" = omarchy-browser.desktop
+  check "Hyprland rules are current" block_current "$HYPR" -- "$ROOT/assets/hypr.lua"
+  check "menu rows are current" block_current "$MENU" // "$ROOT/assets/menu.jsonc"
+  check "flags are current" block_current "$FLAGS" '#' "$ROOT/assets/flags.conf"
+  check "theme hook is current" cmp -s "$ROOT/hooks/vivaldi-omarchy-theme" "$CONFIG/omarchy/hooks/theme-set.d/vivaldi-omarchy-theme"
+  check "update hook is current" cmp -s "$ROOT/hooks/vivaldi-omarchy-update" "$CONFIG/omarchy/hooks/post-update.d/vivaldi-omarchy-update"
+  if command -v hyprctl >/dev/null && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] &&
+    [[ $(hyprctl clients -j | jq '[.[] | select(.class == "vivaldi-stable")] | length') -gt 0 ]]; then
+    check "Vivaldi windows are tagged as a browser" bash -c \
+      "hyprctl clients -j | jq -e '[.[] | select(.class == \"vivaldi-stable\") | .tags[] | select(startswith(\"chromium-based-browser\"))] | length > 0'"
+  fi
+  if grep -qE '\[vV\]ivaldi|"vivaldi' "${OMARCHY_PATH:-/usr/share/omarchy}/default/hypr/apps/browser.lua" 2>/dev/null; then
+    report note "Omarchy now matches lowercase Vivaldi; the local Hyprland rule may be redundant"
+  fi
+  if hyprchroma_manages_vivaldi; then
+    report note "theme sync off: Hyprchroma's browsers option manages Vivaldi's theme"
+  fi
+  if ((problems > 0)) && [[ $quiet != --quiet ]]; then
+    echo "Re-run setup to repair these: $ROOT/bin/vivaldi-omarchy setup"
+  fi
+  ((problems == 0))
+}
+
+usage() {
+  cat <<USAGE
+Usage: vivaldi-omarchy <command>
+
+  setup [--default] [--policy] [--dry-run]
+                     Apply the integration; --dry-run only shows the changes
+  doctor [--quiet]   Check the integration
+  default            Make Vivaldi the default browser
+  theme sync         Queue the Omarchy theme and apply it if Vivaldi is closed
+  theme apply        Apply a queued theme if Vivaldi is closed
+  remove             Uninstall the Vivaldi package; profiles stay
+  uninstall          Undo setup before: omarchy plugin remove $ID
+USAGE
+}
+
+case ${1:-} in
+setup) shift; cmd_setup "$@" ;;
+uninstall) cmd_uninstall ;;
+default) cmd_default ;;
+remove) cmd_remove ;;
+doctor) shift; cmd_doctor "$@" ;;
+first-run) cmd_first_run ;;
+-h | --help | help) usage ;;
+theme)
+  case ${2:-} in
+  sync) theme_sync ;;
+  apply) theme_apply ;;
+  *) die "usage: vivaldi-omarchy theme <sync|apply>" ;;
+  esac
+  ;;
+*)
+  usage >&2
+  exit 1
+  ;;
+esac

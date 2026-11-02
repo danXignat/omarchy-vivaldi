@@ -1,0 +1,7 @@
+#!/bin/bash
+tool="$HOME/.config/omarchy/plugins/io.github.danxignat.vivaldi/bin/vivaldi-omarchy"
+[[ -x $tool ]] || exit 0
+if ! "$tool" doctor --quiet; then
+  omarchy-notification-send -g 󰖟 "Vivaldi integration needs attention" "Run vivaldi-omarchy doctor"
+fi
+exit 0
